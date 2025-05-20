@@ -2,34 +2,38 @@
 #include <fstream>
 #include <string>
 #include <vector>
-#include <openssl/evp.h>
-#include <openssl/rand.h>
-#include <termios.h>
-#include <unistd.h>
+#include <sstream>
 #include <cstdlib>
 #include <sys/stat.h>
+#include <windows.h>
 
-// Configuration
-const std::string VAULT_FILE = "vault.dat";
-const std::string TEMP_FILE = "/tmp/vault_edit.tmp";
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+
+#include "arguments.hpp"
+#include "editor.hpp"
+
 const int SALT_LEN = 16;
 const int KEY_LEN = 32;
 const int IV_LEN = 16;
 const int PBKDF2_ITERATIONS = 100000;
+const std::string HEADER = "# VAULT";
 
-// Utility to read a password silently
+void change_passphrase(const std::string& filename);
+
+// Utility to read a password silently (Windows-only)
 std::string getpass(const std::string& prompt) {
     std::cout << prompt;
-    termios oldt, newt;
     std::string password;
 
-    tcgetattr(STDIN_FILENO, &oldt);
-    newt = oldt;
-    newt.c_lflag &= ~ECHO;
+    HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD mode;
+    GetConsoleMode(hStdin, &mode);
+    SetConsoleMode(hStdin, mode & ~ENABLE_ECHO_INPUT);
 
-    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
     std::getline(std::cin, password);
-    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+
+    SetConsoleMode(hStdin, mode);
     std::cout << std::endl;
 
     return password;
@@ -101,44 +105,98 @@ bool file_exists(const std::string& filename) {
     return (stat(filename.c_str(), &buffer) == 0);
 }
 
+#include "arguments.hpp"
+
 int main(int argc, char** argv) {
+    auto opts = resolveArguments(argc, argv);
+    std::string VAULT_FILE = opts.vaultFile;
+
+    if (opts.showHelp) {
+        std::cout << "Usage: vault.exe [--filepath <file>] [--change_pass]" << std::endl;
+        return 1;
+    }
+
+    std::cout << "Using vault: " << opts.vaultFile << std::endl;
+
+    if (opts.changePass) {
+        change_passphrase(opts.vaultFile);
+        return 0;
+    }
+
     std::string pass = getpass("Enter passphrase: ");
-    std::vector<unsigned char> file_data;
+    std::string editable;
 
     if (file_exists(VAULT_FILE)) {
         std::ifstream in(VAULT_FILE, std::ios::binary);
-        file_data.assign((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        std::vector<unsigned char> file_data((std::istreambuf_iterator<char>(in)), {});
         in.close();
 
         std::string plaintext = decrypt(file_data, pass);
-        if (plaintext.empty()) {
-            std::cerr << "Failed to decrypt file. Wrong password?" << std::endl;
+        std::istringstream iss(plaintext);
+        std::string header;
+        std::getline(iss, header);
+
+        if (header != HEADER) {
+            std::cerr << "Invalid vault file. Decryption failed or header missing." << std::endl;
             return 1;
         }
 
-        std::ofstream tmp(TEMP_FILE);
-        tmp << plaintext;
-        tmp.close();
+        editable.assign(std::istreambuf_iterator<char>(iss), {});
     } else {
-        std::ofstream tmp(TEMP_FILE);
-        tmp << "# New vault\n";
-        tmp.close();
+        editable = "New vault";
     }
 
-    std::string editor = std::getenv("EDITOR") ? std::getenv("EDITOR") : "nano";
-    std::string command = editor + " " + TEMP_FILE;
-    std::system(command.c_str());
+    std::string edited = launch_editor(editable);
+    std::string final_content = HEADER + "\n" + edited;
 
-    std::ifstream tmp_in(TEMP_FILE);
-    std::string edited((std::istreambuf_iterator<char>(tmp_in)), std::istreambuf_iterator<char>());
-    tmp_in.close();
-
-    std::vector<unsigned char> encrypted = encrypt(edited, pass);
+    std::vector<unsigned char> encrypted = encrypt(final_content, pass);
     std::ofstream out(VAULT_FILE, std::ios::binary);
-    out.write((char*)encrypted.data(), encrypted.size());
+    out.write(reinterpret_cast<char*>(encrypted.data()), encrypted.size());
     out.close();
 
-    std::remove(TEMP_FILE.c_str());
     std::cout << "Vault saved successfully." << std::endl;
     return 0;
+}
+
+void change_passphrase(const std::string& filename) {
+    if (!std::ifstream(filename)) {
+        std::cerr << "Vault file does not exist: " << filename << std::endl;
+        return;
+    }
+
+    std::string current_pass = getpass("Enter current passphrase: ");
+
+    std::ifstream in(filename, std::ios::binary);
+    std::vector<unsigned char> file_data((std::istreambuf_iterator<char>(in)), {});
+    in.close();
+
+    std::string plaintext;
+    try {
+        plaintext = decrypt(file_data, current_pass);
+    } catch (...) {
+        std::cerr << "Decryption failed. Incorrect passphrase?" << std::endl;
+        return;
+    }
+
+    std::istringstream iss(plaintext);
+    std::string header;
+    std::getline(iss, header);
+    if (header != HEADER) {
+        std::cerr << "Invalid vault header." << std::endl;
+        return;
+    }
+
+    std::string new_pass1 = getpass("Enter new passphrase: ");
+    std::string new_pass2 = getpass("Re-enter new passphrase: ");
+    if (new_pass1 != new_pass2) {
+        std::cerr << "Passwords do not match." << std::endl;
+        return;
+    }
+
+    std::vector<unsigned char> encrypted = encrypt(plaintext, new_pass1);
+    std::ofstream out(filename, std::ios::binary);
+    out.write(reinterpret_cast<char*>(encrypted.data()), encrypted.size());
+    out.close();
+
+    std::cout << "Passphrase changed successfully." << std::endl;
 }
