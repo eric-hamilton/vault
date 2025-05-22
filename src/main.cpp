@@ -105,8 +105,6 @@ bool file_exists(const std::string& filename) {
     return (stat(filename.c_str(), &buffer) == 0);
 }
 
-#include "arguments.hpp"
-
 int main(int argc, char** argv) {
     auto opts = resolveArguments(argc, argv);
     std::string VAULT_FILE = opts.vaultFile;
@@ -125,6 +123,7 @@ int main(int argc, char** argv) {
 
     std::string pass = getpass("Enter passphrase: ");
     std::string editable;
+    bool newfile = false;
 
     if (file_exists(VAULT_FILE)) {
         std::ifstream in(VAULT_FILE, std::ios::binary);
@@ -143,13 +142,28 @@ int main(int argc, char** argv) {
 
         editable.assign(std::istreambuf_iterator<char>(iss), {});
     } else {
+        newfile = true;
         editable = "New vault";
     }
 
     std::string edited = launch_editor(editable);
-    std::string final_content = HEADER + "\n" + edited;
 
+    // Strip trailing newline(s) for a clean comparison
+    auto trim = [](const std::string& s) {
+        size_t end = s.find_last_not_of("\r\n");
+        return (end == std::string::npos) ? "" : s.substr(0, end + 1);
+    };
+
+    if (trim(edited) == trim(editable)) {
+        if (!newfile){
+            std::cout << "No changes made. Vault not updated." << std::endl;
+            return 0;
+        }
+    }
+
+    std::string final_content = HEADER + "\n" + edited;
     std::vector<unsigned char> encrypted = encrypt(final_content, pass);
+
     std::ofstream out(VAULT_FILE, std::ios::binary);
     out.write(reinterpret_cast<char*>(encrypted.data()), encrypted.size());
     out.close();
